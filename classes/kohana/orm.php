@@ -224,6 +224,12 @@ class Kohana_ORM extends Model implements serializable {
 	protected $_primary_key = 'id';
 
 	/**
+	 * Was $_primary_key specified as a scalar?
+	 * @var bool
+	 */
+	protected $_primary_key_is_scalar = NULL;
+
+	/**
 	 * Primary key value
 	 * @var mixed
 	 */
@@ -303,10 +309,33 @@ class Kohana_ORM extends Model implements serializable {
 		{
 			if (is_array($id))
 			{
-				foreach ($id as $column => $value)
+				$is_assoc = false;
+				foreach (array_keys($id) as $k => $v)
 				{
-					// Passing an array of column => values
-					$this->where($column, '=', $value);
+					if ($k !== $v)
+					{
+						$is_assoc = true;
+						break;
+					}
+				}
+
+				// If $id is associative then search for its column/value pairs.
+				if ($is_assoc)
+				{
+					foreach ($id as $column => $value)
+					{
+						// Passing an array of column => values
+						$this->where($column, '=', $value);
+					}
+				}
+
+				// If $id is not associate, match values to primary key columns.
+				else
+				{
+					foreach ($this->_primary_key as $idx => $pk_col)
+					{
+						$this->where($pk_col, '=', $id[$idx]);
+					}
 				}
 
 				$this->find();
@@ -314,7 +343,7 @@ class Kohana_ORM extends Model implements serializable {
 			else
 			{
 				// Passing the primary key
-				$this->where($this->_table_name.'.'.$this->_primary_key, '=', $id)->find();
+				$this->where($this->_table_name.'.'.$this->_primary_key[0], '=', $id)->find();
 			}
 		}
 		elseif ( ! empty($this->_cast_data))
@@ -334,6 +363,9 @@ class Kohana_ORM extends Model implements serializable {
 	 */
 	protected function _initialize()
 	{
+		$this->_primary_key_is_scalar = ! is_array($this->_primary_key);
+		$this->_primary_key = (array) $this->_primary_key;
+
 		// Set the object name and plural name
 		$this->_object_name = strtolower(substr(get_class($this), 6));
 		$this->_object_plural = Inflector::plural($this->_object_name);
@@ -362,6 +394,7 @@ class Kohana_ORM extends Model implements serializable {
 			$defaults['foreign_key'] = $alias.$this->_foreign_key_suffix;
 
 			$this->_belongs_to[$alias] = array_merge($defaults, $details);
+			$this->_belongs_to[$alias]['foreign_key'] = (array) $this->_belongs_to[$alias]['foreign_key'];
 		}
 
 		foreach ($this->_has_one as $alias => $details)
@@ -370,6 +403,7 @@ class Kohana_ORM extends Model implements serializable {
 			$defaults['foreign_key'] = $this->_object_name.$this->_foreign_key_suffix;
 
 			$this->_has_one[$alias] = array_merge($defaults, $details);
+			$this->_has_one[$alias]['foreign_key'] = (array) $this->_has_one[$alias]['foreign_key'];
 		}
 
 		foreach ($this->_has_many as $alias => $details)
@@ -380,6 +414,8 @@ class Kohana_ORM extends Model implements serializable {
 			$defaults['far_key'] = Inflector::singular($alias).$this->_foreign_key_suffix;
 
 			$this->_has_many[$alias] = array_merge($defaults, $details);
+			$this->_has_many[$alias]['foreign_key'] = (array) $this->_has_many[$alias]['foreign_key'];
+			$this->_has_many[$alias]['far_key'] = (array) $this->_has_many[$alias]['far_key'];
 		}
 
 		// Load column information
@@ -464,7 +500,7 @@ class Kohana_ORM extends Model implements serializable {
 		$this->_load_values($values);
 
 		// Reset primary key
-		$this->_primary_key_value = NULL;
+		$this->_primary_key_value = array();
 
 		$this->reset();
 
@@ -479,16 +515,20 @@ class Kohana_ORM extends Model implements serializable {
 	 */
 	public function reload()
 	{
-		$primary_key = $this->pk();
+		$primary_key = $this->pk(TRUE);
 
 		// Replace the object and reset the object status
 		$this->_object = $this->_changed = $this->_related = array();
 
 		// Only reload the object if we have one to reload
 		if ($this->_loaded)
-			return $this->clear()
-				->where($this->_table_name.'.'.$this->_primary_key, '=', $primary_key)
-				->find();
+		{
+			$this->clear();
+			foreach ($primary_key as $idx => $pk_val)
+				$this->where($this->_table_name.'.'.$this->_primary_key[$idx],
+				             '=', $pk_val);
+			return $this->find();
+		}
 		else
 			return $this->clear();
 	}
@@ -526,7 +566,7 @@ class Kohana_ORM extends Model implements serializable {
 	 */
 	public function __toString()
 	{
-		return (string) $this->pk();
+		return join('|', $this->pk(TRUE));
 	}
 
 	/**
@@ -630,11 +670,15 @@ class Kohana_ORM extends Model implements serializable {
 			$model = $this->_related($column);
 
 			// Use this model's column and foreign model's primary key
-			$col = $model->_table_name.'.'.$model->_primary_key;
-			$val = $this->_object[$this->_belongs_to[$column]['foreign_key']];
+			foreach ($model->_primary_key as $idx => $pk_col)
+			{
+				$col = $model->_table_name.'.'.$pk_col;
+				$val = $this->_object[$this->_belongs_to[$column]['foreign_key'][$idx]];
 
-			$model->where($col, '=', $val)->find();
+				$model->where($col, '=', $val);
+			}
 
+			$model->find();
 			return $this->_related[$column] = $model;
 		}
 		elseif (isset($this->_has_one[$column]))
@@ -642,11 +686,16 @@ class Kohana_ORM extends Model implements serializable {
 			$model = $this->_related($column);
 
 			// Use this model's primary key value and foreign model's column
-			$col = $model->_table_name.'.'.$this->_has_one[$column]['foreign_key'];
-			$val = $this->pk();
+			$pk = $this->pk(TRUE);
+			foreach ($this->_primary_key as $idx => $pk_col)
+			{
+				$col = $model->_table_name.'.'.$this->_has_one[$column]['foreign_key'][$idx];
+				$val = $pk[$idx];
 
-			$model->where($col, '=', $val)->find();
+				$model->where($col, '=', $val);
+			}
 
+			$model->find();
 			return $this->_related[$column] = $model;
 		}
 		elseif (isset($this->_has_many[$column]))
@@ -657,25 +706,39 @@ class Kohana_ORM extends Model implements serializable {
 			{
 				// Grab has_many "through" relationship table
 				$through = $this->_has_many[$column]['through'];
+				$pk = $this->pk(TRUE);
+
+				$join = $model->join($through);
 
 				// Join on through model's target foreign key (far_key) and target model's primary key
-				$join_col1 = $through.'.'.$this->_has_many[$column]['far_key'];
-				$join_col2 = $model->_table_name.'.'.$model->_primary_key;
+				foreach ($this->_primary_key as $idx => $pk_col)
+				{
+					$join_col1 = $through.'.'.$this->_has_many[$column]['far_key'][$idx];
+					$join_col2 = $model->_table_name.'.'.$model->_primary_key[$idx];
 
-				$model->join($through)->on($join_col1, '=', $join_col2);
+					$join->on($join_col1, '=', $join_col2);
 
-				// Through table's source foreign key (foreign_key) should be this model's primary key
-				$col = $through.'.'.$this->_has_many[$column]['foreign_key'];
-				$val = $this->pk();
+					// Through table's source foreign key (foreign_key) should be this model's primary key
+					$col = $through.'.'.$this->_has_many[$column]['foreign_key'][$idx];
+					$val = $pk[$idx];
+
+					$model->where($col, '=', $val);
+				}
 			}
 			else
 			{
 				// Simple has_many relationship, search where target model's foreign key is this model's primary key
-				$col = $model->_table_name.'.'.$this->_has_many[$column]['foreign_key'];
-				$val = $this->pk();
+				$pk = $this->pk(TRUE);
+				foreach ($this->_primary_key as $idx => $pk_col)
+				{
+					$col = $model->_table_name.'.'.$this->_has_many[$column]['foreign_key'][$idx];
+					$val = $pk[$idx];
+
+					$model->where($col, '=', $val);
+				}
 			}
 
-			return $model->where($col, '=', $val);
+			return $model;
 		}
 		else
 		{
@@ -736,10 +799,14 @@ class Kohana_ORM extends Model implements serializable {
 			// Update related object itself
 			$this->_related[$column] = $value;
 
+			$fk = $value->pk(TRUE);
 			// Update the foreign key of this model
-			$this->_object[$this->_belongs_to[$column]['foreign_key']] = $value->pk();
+			foreach ($this->_belongs_to[$column]['foreign_key'] as $idx => $fk_col)
+			{
+				$this->_object[$this->_belongs_to[$column]['foreign_key'][$idx]] = $fk[$fk_col];
 
-			$this->_changed[$column] = $this->_belongs_to[$column]['foreign_key'];
+				$this->_changed[$column] = $this->_belongs_to[$column]['foreign_key'][$idx];
+			}
 		}
 		else
 		{
@@ -766,7 +833,8 @@ class Kohana_ORM extends Model implements serializable {
 			$expected = array_keys($this->_table_columns);
 
 			// Don't set the primary key by default
-			unset($values[$this->_primary_key]);
+			foreach ($this->_primary_key as $pk_col)
+				unset($values[$pk_col]);
 		}
 
 		foreach ($expected as $key => $column)
@@ -884,21 +952,29 @@ class Kohana_ORM extends Model implements serializable {
 			$this->select(array($name, $alias));
 		}
 
+		// Join the related object into the result
+		$join = $this->join(array($target->_table_name, $target_path), 'LEFT');
+
 		if (isset($parent->_belongs_to[$target_alias]))
 		{
 			// Parent belongs_to target, use target's primary key and parent's foreign key
-			$join_col1 = $target_path.'.'.$target->_primary_key;
-			$join_col2 = $parent_path.'.'.$parent->_belongs_to[$target_alias]['foreign_key'];
+			foreach ($target->_primary_key as $idx => $pk_col)
+			{
+				$join_col1 = $target_path.'.'.$pk_col;
+				$join_col2 = $parent_path.'.'.$parent->_belongs_to[$target_alias]['foreign_key'][$idx];
+				$join->on($join_col1, '=', $join_col2);
+			}
 		}
 		else
 		{
 			// Parent has_one target, use parent's primary key as target's foreign key
-			$join_col1 = $parent_path.'.'.$parent->_primary_key;
-			$join_col2 = $target_path.'.'.$parent->_has_one[$target_alias]['foreign_key'];
+			foreach ($parent->_primary_key as $idx => $pk_col)
+			{
+				$join_col1 = $parent_path.'.'.$pk_col;
+				$join_col2 = $target_path.'.'.$parent->_has_one[$target_alias]['foreign_key'][$idx];
+				$join->on($join_col1, '=', $join_col2);
+			}
 		}
-
-		// Join the related object into the result
-		$this->join(array($target->_table_name, $target_path), 'LEFT')->on($join_col1, '=', $join_col2);
 
 		return $this;
 	}
@@ -1062,21 +1138,31 @@ class Kohana_ORM extends Model implements serializable {
 	 */
 	protected function _load_values(array $values)
 	{
-		if (array_key_exists($this->_primary_key, $values))
+		$pk_valid = TRUE;
+		foreach ($this->_primary_key as $pk_col)
 		{
-			if ($values[$this->_primary_key] !== NULL)
+			if (array_key_exists($pk_col, $values) AND $values[$pk_col] === NULL)
 			{
-				// Flag as loaded, saved, and valid
-				$this->_loaded = $this->_saved = $this->_valid = TRUE;
+				$pk_valid = FALSE;
+				break;
+			}
+		}
 
-				// Store primary key
-				$this->_primary_key_value = $values[$this->_primary_key];
-			}
-			else
+		if ($pk_valid)
+		{
+			// Flag as loaded, saved, and valid
+			$this->_loaded = $this->_saved = $this->_valid = TRUE;
+
+			// Store primary key
+			foreach ($this->_primary_key as $pk_col)
 			{
-				// Not loaded, saved, or valid
-				$this->_loaded = $this->_saved = $this->_valid = FALSE;
+				$this->_primary_key_value[] = $values[$pk_col];
 			}
+		}
+		else
+		{
+			// Not loaded, saved, or valid
+			$this->_loaded = $this->_saved = $this->_valid = FALSE;
 		}
 
 		// Related objects
@@ -1280,11 +1366,17 @@ class Kohana_ORM extends Model implements serializable {
 			->values(array_values($data))
 			->execute($this->_db);
 
-		if ( ! array_key_exists($this->_primary_key, $data))
+		// XXX insert id only present for non-composite PKs
+		if (count($this->_primary_key) == 1 && ! array_key_exists($this->_primary_key[0], $data))
 		{
 			// Load the insert id as the primary key if it was left out
-			$this->_object[$this->_primary_key] = $this->_primary_key_value = $result[0];
+			$this->_object[$this->_primary_key[0]] = $result[0];
 		}
+
+		// XXX always set $this->_primary_key_value otherwise reload() will fail
+		// FIXME or should set() handle this?
+		foreach ($this->_primary_key as $idx => $pk_col)
+			$this->_primary_key_value[$idx] = $this->$pk_col;
 
 		// Object is now loaded and saved
 		$this->_loaded = $this->_saved = TRUE;
@@ -1335,19 +1427,25 @@ class Kohana_ORM extends Model implements serializable {
 			$data[$column] = $this->_object[$column] = ($format === TRUE) ? time() : date($format);
 		}
 
-		// Use primary key value
-		$id = $this->pk();
-
 		// Update a single record
-		DB::update($this->_table_name)
-			->set($data)
-			->where($this->_primary_key, '=', $id)
-			->execute($this->_db);
-
-		if (isset($data[$this->_primary_key]))
+		$update = DB::update($this->_table_name)
+					->set($data);
+		foreach ($this->pk(TRUE) as $idx => $pk_val)
 		{
-			// Primary key was changed, reflect it
-			$this->_primary_key_value = $data[$this->_primary_key];
+			$pk_col = $this->_primary_key[$idx];
+			$update->where($pk_col, '=', $pk_val);
+		}
+		$update->execute($this->_db);
+
+		// do after we know that the update has succeeded...?
+		foreach ($this->pk(TRUE) as $idx => $pk_val)
+		{
+			$pk_col = $this->_primary_key[$idx];
+			if (isset($data[$pk_col]))
+			{
+				// Primary key was changed, reflect it
+				$this->_primary_key_value[$idx] = $data[$pk_col];
+			}
 		}
 
 		// Object has been saved
@@ -1382,13 +1480,13 @@ class Kohana_ORM extends Model implements serializable {
 		if ( ! $this->_loaded)
 			throw new Kohana_Exception('Cannot delete :model model because it is not loaded.', array(':model' => $this->_object_name));
 
-		// Use primary key value
-		$id = $this->pk();
-
 		// Delete the object
-		DB::delete($this->_table_name)
-			->where($this->_primary_key, '=', $id)
-			->execute($this->_db);
+		$delete = DB::delete($this->_table_name);
+		foreach ($this->pk(TRUE) as $idx => $pk_val)
+		{
+			$delete->where($this->_primary_key[$idx], '=', $pk_val);
+		}
+		$delete->execute($this->_db);
 
 		return $this->clear();
 	}
@@ -1410,7 +1508,7 @@ class Kohana_ORM extends Model implements serializable {
 	 */
 	public function has($alias, $far_keys)
 	{
-		$far_keys = ($far_keys instanceof ORM) ? $far_keys->pk() : $far_keys;
+		$far_keys = ($far_keys instanceof ORM) ? $far_keys->pk(TRUE) : $far_keys;
 
 		// We need an array to simplify the logic
 		$far_keys = (array) $far_keys;
@@ -1419,11 +1517,31 @@ class Kohana_ORM extends Model implements serializable {
 		if ( ! $far_keys OR ! $this->_loaded)
 			return FALSE;
 
-		$count = (int) DB::select(array('COUNT("*")', 'records_found'))
-			->from($this->_has_many[$alias]['through'])
-			->where($this->_has_many[$alias]['foreign_key'], '=', $this->pk())
-			->where($this->_has_many[$alias]['far_key'], 'IN', $far_keys)
-			->execute($this->_db)->get('records_found');
+		// If each element of $far_keys must be an array and $far_keys is
+		// unidimensional, then we have a single key and must place it in an
+		// array.
+		$far_key_is_cpk = count($this->_has_many[$alias]['far_key']) > 1;
+		if ($far_key_is_cpk AND ! is_array(current($far_keys)))
+		{
+			$far_keys = array($far_keys);
+		}
+
+		$select = DB::select(array('COUNT("*")', 'records_found'))
+			->from($this->_has_many[$alias]['through']);
+
+		// Quote columns as Database::where() won't DTRT if the "column" is an
+		// array.
+		$cols = array_values($this->_has_many[$alias]['far_key']);
+		$quoted_cols = array_map(array($this->_db, 'quote_column'), $cols);
+		$where_column = DB::expr('('.join(',', $quoted_cols).')');
+		$select->where($where_column, 'IN', $far_keys);
+
+		foreach ($this->pk(TRUE) as $idx => $pk_val)
+		{
+			$select->where($this->_has_many[$alias]['foreign_key'][$idx], '=', $pk_val);
+		}
+
+		$count = (int) $select->execute($this->_db)->get('records_found');
 
 		// Rows found need to match the rows searched
 		return $count === count($far_keys);
@@ -1445,16 +1563,26 @@ class Kohana_ORM extends Model implements serializable {
 	 */
 	public function add($alias, $far_keys)
 	{
-		$far_keys = ($far_keys instanceof ORM) ? $far_keys->pk() : $far_keys;
+		$far_keys = ($far_keys instanceof ORM) ? $far_keys->pk(TRUE) : $far_keys;
 
-		$columns = array($this->_has_many[$alias]['foreign_key'], $this->_has_many[$alias]['far_key']);
-		$foreign_key = $this->pk();
+		$columns = array_merge($this->_has_many[$alias]['foreign_key'], $this->_has_many[$alias]['far_key']);
+		$foreign_key = $this->pk(TRUE);
 
 		$query = DB::insert($this->_has_many[$alias]['through'], $columns);
 
-		foreach ( (array) $far_keys as $key)
+		$far_keys = (array) $far_keys;
+		// If each element of $far_keys must be an array and $far_keys is
+		// unidimensional, then we have a single key and must place it in an
+		// array.
+		$far_key_is_cpk = count($this->_has_many[$alias]['far_key']) > 1;
+		if ($far_key_is_cpk AND ! is_array(current($far_keys)))
 		{
-			$query->values(array($foreign_key, $key));
+			$far_keys = array($far_keys);
+		}
+
+		foreach ($far_keys as $key)
+		{
+			$query->values(array_merge($foreign_key, (array) $key));
 		}
 
 		$query->execute($this->_db);
@@ -1480,15 +1608,38 @@ class Kohana_ORM extends Model implements serializable {
 	 */
 	public function remove($alias, $far_keys = NULL)
 	{
-		$far_keys = ($far_keys instanceof ORM) ? $far_keys->pk() : $far_keys;
+		$far_keys = ($far_keys instanceof ORM) ? $far_keys->pk(TRUE) : $far_keys;
 
-		$query = DB::delete($this->_has_many[$alias]['through'])
-			->where($this->_has_many[$alias]['foreign_key'], '=', $this->pk());
+		$query = DB::delete($this->_has_many[$alias]['through']);
+
+		// Quote columns as Database::where() won't DTRT if the "column" is an
+		// array.
+		$cols = array_values($this->_has_many[$alias]['foreign_key']);
+		$quoted_cols = array_map(array($this->_db, 'quote_column'), $cols);
+		$where_column = DB::expr('('.join(',', $quoted_cols).')');
+		$query->where($where_column, '=', $this->pk(TRUE));
 
 		if ($far_keys !== NULL)
 		{
+			$far_keys = (array) $far_keys;
+
+			// If each element of $far_keys must be an array and $far_keys is
+			// unidimensional, then we have a single key and must place it in an
+			// array.
+			$far_key_is_cpk = count($this->_has_many[$alias]['far_key']) > 1;
+			if ($far_key_is_cpk AND ! is_array(current($far_keys)))
+			{
+				$far_keys = array($far_keys);
+			}
+
+			// Quote columns as Database::where() won't DTRT if the "column" is an
+			// array.
+			$cols = array_values($this->_has_many[$alias]['far_key']);
+			$quoted_cols = array_map(array($this->_db, 'quote_column'), $cols);
+			$where_column = DB::expr('('.join(',', $quoted_cols).')');
+
 			// Remove all the relationships in the array
-			$query->where($this->_has_many[$alias]['far_key'], 'IN', (array) $far_keys);
+			$query->where($where_column, 'IN', $far_keys);
 		}
 
 		$query->execute($this->_db);
@@ -1595,13 +1746,17 @@ class Kohana_ORM extends Model implements serializable {
 	}
 
 	/**
-	 * Returns the value of the primary key
+	 * Returns the value of the primary key.  By default the value will be
+	 * returned as a scalara if the primary key was specified as a scalar.
 	 *
+	 * @param bool $ignore_scalar Pass TRUE to return value as an array
 	 * @return mixed Primary key
 	 */
-	public function pk()
+	public function pk($ignore_scalar = FALSE)
 	{
-		return $this->_primary_key_value;
+		return ($this->_primary_key_is_scalar && ! $ignore_scalar)
+			? $this->_primary_key_value[0]
+			: $this->_primary_key_value;
 	}
 
 	/**
